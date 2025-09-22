@@ -291,8 +291,10 @@ function card(r){
   const cat = useCat(r.usefulness_score); const label = useLabel(cat); const dot = useDot(cat);
   const text = escapeHTML(r.review_text||'');
   const topics = (flattenTopics(r)||[]).map(t=>`<span class="topic">${escapeHTML(t)}</span>`).join('');
-  const lang = String(r.language||'').toLowerCase();
-  const isEN = lang==='en', isCS = lang==='cs', isDE = lang==='de';
+  const rawLang = String(r.language||'').toLowerCase();
+const lang = (rawLang === 'cz') ? 'cs' : rawLang;
+const isEN = lang==='en', isCS = lang==='cs', isDE = lang==='de';
+
   const id = escapeHTML(r.review_id||'');
   return `<article class="review" data-id="${id}" data-src-lang="${lang||''}">
     <div class="review__head">
@@ -403,9 +405,13 @@ function translatePlaceholder(text, from, to){
     cs:{ 'car':'auto','navigation':'navigace','trunk':'kufr','highway':'dálnice' },
     de:{ 'car':'Auto','navigation':'Navigation','trunk':'Kofferraum','highway':'Autobahn' }
   };
-  const map = dict[to]||{};
-  return tag + String(text).replace(/\b([A-Za-zÁ-ž]+)\b/g, w=> map[w] || map[w.toLowerCase()] || w);
+  const map = dict[to] || {};
+  // proper word boundaries and use the captured word
+  return tag + String(text).replace(/\b([A-Za-zÁ-ž]+)\b/g, (m, word) =>
+    map[word] || map[word.toLowerCase()] || word
+  );
 }
+
 
 /* --- Per-card translate buttons (EN/CZ/DE) with API + fallback --- */
 (function(){
