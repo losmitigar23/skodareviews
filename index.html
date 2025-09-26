@@ -431,5 +431,297 @@ boot();
 })();
 
 </script>
+<script>
+(function(){
+  "use strict";
+
+  // --- Helpers: "global" export so future code can reuse if needed
+  const ReviewsApp = window.ReviewsApp = {};
+
+  // 1) Pull & parse dataset
+  function getData(){
+    const el = document.getElementById("reviews-data");
+    if(!el){console.warn("reviews-data script tag not found");return [];}
+    try{ return JSON.parse(el.textContent || "[]"); }catch(e){ console.error("Bad JSON in #reviews-data",e); return []; }
+  }
+
+  // 2) Normalize language codes (ELI5: we make weird inputs consistent)
+  //    - Lowercase, keep 2 letters if longer (en-GB -> en)
+  //    - Map "cz" -> "cs" (Czech), tolerate typos/case
+  const LANG_MAP = { "cz":"cs" };
+  function normalizeLangCode(raw){
+    if(!raw) return "und";
+    let s = String(raw).trim().toLowerCase();
+    // take part before '-' (en-gb -> en)
+    if(s.includes("-")) s = s.split("-")[0];
+    // unify special cases
+    if(LANG_MAP[s]) s = LANG_MAP[s];
+    // keep to 2 letters if looks longer (e.g., 'eng' -> 'en')
+    if(s.length>2) s = s.slice(0,2);
+    return s; // e.g., "de","en","cs","it","fr","sk","sv","nl","pl","fi","pt","es","no","uk","lb","la","oc","cy","ca"
+  }
+  ReviewsApp.normalizeLangCode = normalizeLangCode;
+
+  // 3) Small formatters
+  const fmt = {
+    stars(n){ const s = Math.round(Number(n)||0); return "★".repeat(s) + "☆".repeat(5-s); },
+    date(d){ try{ return new Date(d).toLocaleString(); }catch{ return String(d||""); } },
+    country(c){ return c==="ZZ"||!c ? "—" : c; }
+  };
+
+  // 4) Build filter model
+  const state = {
+    data: [],
+    filters: {
+      platform:new Set(), rating:new Set(), usefulness:new Set(), topic:new Set(), country:new Set()
+    },
+    sort:"DEFAULT"
+  };
+
+  // Usefulness buckets (labels → predicate)
+  const USE_BUCKETS = [
+    {k:"0–9",   f:v=>v>=0 && v<=9},
+    {k:"10–24", f:v=>v>=10&& v<=24},
+    {k:"25–49", f:v=>v>=25&& v<=49},
+    {k:"50+",   f:v=>v>=50}
+  ];
+
+  // 5) Ingest + normalize data
+  function prepareData(raw){
+    return raw.map(r=>{
+      const lang_norm = normalizeLangCode(r.language);
+      return {
+        ...r,
+        language_norm: lang_norm,
+        rating: Number(r.rating)||0,
+        usefulness_score: Number(r.usefulness_score)||0,
+        dateObj: new Date(r.date)
+      };
+    });
+  }
+
+  // 6) Unique sets for pills
+  function uniques(list, getter){
+    return [...new Set(list.map(getter).flat().filter(Boolean))].sort((a,b)=>String(a).localeCompare(String(b)));
+  }
+
+  // 7) DOM shortcuts
+  const $cards = document.getElementById("cards");
+  const $filteredTag = document.getElementById("filteredTag");
+  const $sort = document.getElementById("sortSelect");
+  const $pillGroups = {
+    platform: document.querySelector('.pills[data-group="platform"]'),
+    rating: document.querySelector('.pills[data-group="rating"]'),
+    usefulness: document.querySelector('.pills[data-group="usefulness"]'),
+    topic: document.querySelector('.pills[data-group="topic"]'),
+    country: document.querySelector('.pills[data-group="country"]'),
+  };
+  const $btnClear = document.getElementById("btn-clear");
+
+  // 8) Pills builder
+  function makePill(label, groupKey, value, isAll=false){
+    const btn = document.createElement("button");
+    btn.className = "pill" + (isAll?" pill--all":"");
+    btn.type = "button";
+    btn.textContent = label;
+    btn.dataset.value = value ?? "";
+    btn.addEventListener("click", ()=>{
+      const set = state.filters[groupKey];
+      if(isAll){
+        set.clear();
+        syncPills(groupKey);
+        render();
+        return;
+      }
+      if(set.has(value)) set.delete(value); else set.add(value);
+      syncPills(groupKey);
+      render();
+    });
+    return btn;
+  }
+
+  function syncPills(groupKey){
+    const wrap = $pillGroups[groupKey];
+    if(!wrap) return;
+    const active = state.filters[groupKey];
+    wrap.querySelectorAll(".pill").forEach(b=>{
+      const isAll = b.classList.contains("pill--all");
+      const val = b.dataset.value;
+      b.classList.toggle("selected", isAll ? active.size===0 : active.has(val));
+    });
+    // Gray-out others when all-on to show context
+    wrap.classList.toggle("is-all-on", active.size===0);
+  }
+
+  function buildAllPills(){
+    // Platform
+    const platforms = uniques(state.data, r=>r.platform);
+    fillPills("platform", ["All"], platforms);
+
+    // Rating (1..5)
+    const ratings = [5,4,3,2,1]; // fixed order
+    fillPills("rating", ["All"], ratings.map(n=>`${n}★`), ratings.map(n=>String(n)));
+
+    // Usefulness buckets
+    fillPills("usefulness", ["All"], USE_BUCKETS.map(b=>b.k));
+
+    // Topic
+    const topics = uniques(state.data, r=>r.topics_list||[]);
+    fillPills("topic", ["All"], topics);
+
+    // Country
+    const countries = uniques(state.data, r=>fmt.country(r.country));
+    fillPills("country", ["All"], countries);
+  }
+
+  function fillPills(groupKey, leadLabels, labels, values){
+    const wrap = $pillGroups[groupKey];
+    if(!wrap) return;
+    wrap.innerHTML = "";
+    // All
+    wrap.appendChild(makePill("All", groupKey, "", true));
+    // Items
+    labels.forEach((lab,i)=>{
+      const val = values ? values[i] : lab;
+      wrap.appendChild(makePill(lab, groupKey, String(val)));
+    });
+    syncPills(groupKey);
+  }
+
+  // 9) Filtering + sorting
+  function passesFilters(r){
+    // platform
+    if(state.filters.platform.size && !state.filters.platform.has(String(r.platform))) return false;
+    // rating (exact integer match)
+    if(state.filters.rating.size && ![...state.filters.rating].some(v=>Number(v)===Math.round(r.rating))) return false;
+    // usefulness (bucket contains)
+    if(state.filters.usefulness.size){
+      const ok = [...state.filters.usefulness].some(k=>{
+        const b = USE_BUCKETS.find(x=>x.k===k); return b && b.f(r.usefulness_score);
+      });
+      if(!ok) return false;
+    }
+    // topic
+    if(state.filters.topic.size){
+      const topics = r.topics_list||[];
+      const ok = [...state.filters.topic].some(t=>topics.includes(t));
+      if(!ok) return false;
+    }
+    // country
+    if(state.filters.country.size){
+      const c = fmt.country(r.country);
+      if(!state.filters.country.has(c)) return false;
+    }
+    return true;
+  }
+
+  const sorters = {
+    DEFAULT(a,b){ return b.dateObj - a.dateObj; }, // newest first
+    STARS_ASC(a,b){ return a.rating - b.rating || (b.dateObj - a.dateObj); },
+    STARS_DESC(a,b){ return b.rating - a.rating || (b.dateObj - a.dateObj); },
+    USE_ASC(a,b){ return a.usefulness_score - b.usefulness_score || (b.dateObj - a.dateObj); },
+    USE_DESC(a,b){ return b.usefulness_score - a.usefulness_score || (b.dateObj - a.dateObj); },
+  };
+
+  // 10) Render cards
+  function render(){
+    const filtered = state.data.filter(passesFilters).sort(sorters[state.sort] || sorters.DEFAULT);
+    $filteredTag.hidden = Object.values(state.filters).every(s=>s.size===0);
+
+    $cards.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    filtered.forEach(r=>{
+      const card = document.createElement("article");
+      card.className = "review";
+
+      // Head
+      const head = document.createElement("div");
+      head.className = "review__head";
+      const left = document.createElement("div");
+      const right = document.createElement("div");
+      right.className = "meta";
+
+      const rating = document.createElement("span");
+      rating.className = "rating";
+      rating.innerHTML = `${fmt.stars(r.rating)} <span class="star">${r.rating.toFixed(1)}</span>`;
+
+      left.appendChild(rating);
+
+      // meta chips
+      function chip(txt){ const c=document.createElement("span"); c.className="chip"; c.textContent=txt; return c; }
+      right.appendChild(chip(r.platform||""));
+      right.appendChild(chip(`v ${r.app_version||"—"}`));
+      right.appendChild(chip(`lang ${r.language_norm}`));
+      right.appendChild(chip(fmt.country(r.country)));
+
+      head.appendChild(left);
+      head.appendChild(right);
+
+      // Topics
+      const topicsWrap = document.createElement("div");
+      topicsWrap.className = "topics";
+      (r.topics_list||[]).forEach(t=>{
+        const s=document.createElement("span"); s.className="topic"; s.textContent=t; topicsWrap.appendChild(s);
+      });
+
+      // Text
+      const p = document.createElement("p");
+      p.textContent = r.review_text || "";
+
+      // Footer
+      const footer = document.createElement("div");
+      footer.className = "review__footer";
+      const meta = document.createElement("div");
+      meta.className="meta";
+      meta.innerHTML = `
+        <span>Usefulness: ${r.usefulness_score}</span>
+        <span>•</span>
+        <span>${fmt.date(r.date)}</span>
+      `;
+      footer.appendChild(meta);
+
+      card.appendChild(head);
+      if((r.topics_list||[]).length) card.appendChild(topicsWrap);
+      card.appendChild(p);
+      card.appendChild(footer);
+      frag.appendChild(card);
+    });
+    $cards.appendChild(frag);
+  }
+
+  // 11) Events
+  $sort?.addEventListener("change", ()=>{ state.sort = $sort.value || "DEFAULT"; render(); });
+  $btnClear?.addEventListener("click", ()=>{
+    Object.values(state.filters).forEach(s=>s.clear());
+    Object.keys($pillGroups).forEach(syncPills);
+    state.sort = "DEFAULT";
+    if($sort) $sort.value = "DEFAULT";
+    render();
+  });
+
+  // 12) Initialize
+  function init(){
+    state.data = prepareData(getData());
+    buildAllPills();
+    // Select default sort option if exists
+    if($sort) $sort.value = state.sort;
+    render();
+
+    // Also wire header language flag buttons to no-op (visual only) unless you want me to localize strings later.
+    document.querySelectorAll(".flagbtn").forEach(btn=>{
+      btn.addEventListener("click",()=>{
+        document.querySelectorAll(".flagbtn").forEach(b=>b.classList.remove("selected"));
+        btn.classList.add("selected");
+      });
+    });
+  }
+
+  // kick off when DOM ready
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+
+})();
+</script>
+
 </body>
 </html>
